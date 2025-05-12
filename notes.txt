@@ -1,0 +1,250 @@
+Command to Run Fly_Check:
+~/.pyenv/versions/3.11.4/bin/python /Users/germain/Downloads/Fly\ Position/fly_check.py
+
+Command to Run Position:
+~/.pyenv/versions/3.11.4/bin/python /Users/germain/Downloads/Fly\ Position/position.py
+
+Command to Run Square_fly:
+~/.pyenv/versions/3.11.4/bin/python /Users/germain/Downloads/Fly\ Position/square_fly.py
+
+Command for Trajectory:
+~/.pyenv/versions/3.11.4/bin/python /Users/germain/Downloads/Fly\ Position/Trajectory.py
+
+Command for Test:
+~/.pyenv/versions/3.11.4/bin/python /Users/germain/Downloads/Fly\ Position/test.py
+
+Command for Swarm:
+~/.pyenv/versions/3.11.4/bin/python /Users/germain/Downloads/Fly\ Position/swarm.py
+
+
+
+Code to revert to for fly_check (in case of mess ups):
+
+import time
+import threading
+import logging
+
+import cflib.crtp         # Low-level driver initialization
+from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.high_level_commander import HighLevelCommander
+from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+from cflib.crazyflie.syncLogger import SyncLogger
+from cflib.crazyflie.log import LogConfig
+
+# Global variables updated by the logger callback
+current_x = 0.0
+current_y = 0.0
+current_z = 0.0
+
+#--------------------------------------------------------------------
+# PID controller class for one axis
+#--------------------------------------------------------------------
+class PIDController:
+    def __init__(self, kp, ki, kd, setpoint=0.0):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.setpoint = setpoint
+        self.integral = 0.0
+        self.last_error = 0.0
+
+    def update(self, measurement, dt):
+        output_edge = 0.05
+        error = self.setpoint - measurement
+        self.integral += error * dt
+        derivative = (error - self.last_error) / dt if dt > 0 else 0.0
+        output = self.kp * error + self.ki * self.integral + self.kd * derivative
+        self.last_error = error
+        if output > output_edge:
+            output = output_edge
+        elif output < -output_edge:
+            output = -output_edge
+        return output
+
+#--------------------------------------------------------------------
+# Log callback to update state estimates
+#--------------------------------------------------------------------
+def log_callback(timestamp, data, logconf):
+    global current_x, current_y, current_z
+    if 'stateEstimate.x' in data:
+        current_x = data['stateEstimate.x']
+    if 'stateEstimate.y' in data:
+        current_y = data['stateEstimate.y']
+    if 'stateEstimate.z' in data:
+        current_z = data['stateEstimate.z']
+
+#--------------------------------------------------------------------
+# Thread function to run the logger
+#--------------------------------------------------------------------
+def log_thread_func(scf, log_conf):
+    with SyncLogger(scf, log_conf) as logger:
+        for log_entry in logger:
+            timestamp, data, logconf = log_entry
+            log_callback(timestamp, data, logconf)
+
+#--------------------------------------------------------------------
+# Main flight routine using high-level commands with XY PID correction
+#--------------------------------------------------------------------
+def main():
+    logging.basicConfig(level=logging.INFO)
+    cflib.crtp.init_drivers()
+
+    # Change to your Crazyflie's URI
+    URI = 'radio://0/80/2M'
+
+    # Flight parameters
+    target_altitude = 1.0       # meters
+    takeoff_duration = 2.0      # seconds for high-level takeoff command
+    hold_duration = 5.0        # seconds during which we update position via go_to and PID
+    go_to_duration = 0.2
+
+    # PID controllers for the XY plane (tune these gains for your setup)
+    # These controllers output a correction in meters to add to the original setpoint.
+    pid_x = PIDController(kp=0.2, ki=0.0, kd=0.1)
+    pid_y = PIDController(kp=0.2, ki=0.0, kd=0.1)
+
+    with SyncCrazyflie(URI, cf=Crazyflie(rw_cache='./cache')) as scf:
+        # Set up logging for state estimation (for x, y, z)
+        log_conf = LogConfig(name='StateEstimate', period_in_ms=50)
+        log_conf.add_variable('stateEstimate.x', 'float')
+        log_conf.add_variable('stateEstimate.y', 'float')
+        log_conf.add_variable('stateEstimate.z', 'float')
+        log_thread = threading.Thread(target=log_thread_func, args=(scf, log_conf))
+        log_thread.daemon = True
+        log_thread.start()
+
+        # Create a HighLevelCommander instance
+        commander = HighLevelCommander(scf.cf)
+
+        # ------------------------
+        # TAKEOFF using high-level command
+        # ------------------------
+        print(f"Taking off to {target_altitude} m altitude...")
+        commander.takeoff(target_altitude, takeoff_duration)
+        time.sleep(takeoff_duration + 1.0)
+
+        # Record the initial XY position as the setpoint for holding position
+        setpoint_x = current_x
+        setpoint_y = current_y
+        pid_x.setpoint = setpoint_x
+        pid_y.setpoint = setpoint_y
+        print(f"Recorded hold position: x = {setpoint_x:.2f}, y = {setpoint_y:.2f}")
+
+        # ------------------------
+        # HOLD XY position using PID corrections with repeated go_to commands
+        # ------------------------
+        print("Holding XY position using PID corrections via go_to...")
+        hold_start = time.time()
+        last_time = hold_start
+        while time.time() - hold_start < hold_duration:
+            now = time.time()
+            dt = now - last_time
+            last_time = now
+
+            # Calculate corrections (in meters) from PID controllers
+            correction_x = pid_x.update(current_x, dt)
+            correction_y = pid_y.update(current_y, dt)
+
+            # Compute a new XY target by adding the correction.
+            # (This effectively adjusts the reference so that the drone is driven back toward the initial setpoint.)
+            new_target_x = setpoint_x + correction_x
+            new_target_y = setpoint_y + correction_y
+
+            # Use high-level go_to command to update the target position.
+            # We keep the altitude constant at target_altitude and yaw at 0.
+            commander.go_to(new_target_x, new_target_y, target_altitude, yaw=0.0, duration_s=go_to_duration, relative=False)
+
+
+            # Debug: print current state and computed target
+            print(f"Time: {time.time()-hold_start:4.1f}s | "
+                  f"Measured: x={current_x:6.2f}, y={current_y:6.2f} | "
+                  f"Target: x={new_target_x:6.2f}, y={new_target_y:6.2f} | "
+                  f"PID: corr_x={correction_x:5.3f}, corr_y={correction_y:5.3f}")
+
+            # (The go_to call blocks for go_to_duration seconds)
+            # Optionally, a short sleep may be added here.
+            
+        # ------------------------
+        # LAND using high-level command
+        # ------------------------
+        land_duration = 2.0
+        print("Hold complete. Initiating landing...")
+        commander.land(0.0, land_duration)
+        time.sleep(land_duration + 1.0)
+        print("Landed successfully.")
+
+if __name__ == '__main__':
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+    Old:
+
+pid_x.setpoint = 0.0
+pid_y.setpoint = 0.0
+New:
+
+setpoint_x = current_x
+setpoint_y = current_y
+pid_x.setpoint = setpoint_x
+pid_y.setpoint = setpoint_y
+
+
+This locks in the current position after takeoff, so it hovers at the exact spot it took off from.
+
+
+
+
+1. Structured into main() function
+Original code was likely procedural (top-to-bottom).
+
+Now wrapped in a main() function and guarded with if __name__ == '__main__': main() to make the script clean, modular, and reusable.
+
+2. PID Controller Class
+A PIDController class was added:
+
+Handles fine-tuned corrections to the drone’s X and Y coordinates.
+
+Has deadzone logic (ignores small error values).
+
+Has output cap (limits how much correction can be applied to prevent overshooting).
+
+3. Real-Time Logging Thread
+A background thread was added to handle position logging from the drone:
+
+log_thread = threading.Thread(target=log_thread_func, args=(scf, log_conf))
+This keeps current_x, current_y, and current_z updated during the flight in near real-time.
+
+4. Maintains Hover Using PID Correction
+Once in the air, the drone:
+
+Takes its current x, y as a "hover target".
+
+PID controllers constantly correct the drone’s position back to that target during hover_duration.
+
+5. Using commander.go_to() Instead of Simple Hover
+Instead of blindly hovering, it now uses:
+
+commander.go_to(new_x, new_y, target_altitude, ...)
+Applies minor PID-corrected adjustments to X and Y.
+
+Keeps it stable in small disturbances.
+
+6. Logging Position and PID Output
+Includes print statements to help you debug real-time behavior:
+
+
+print(f"[{time.time()-hover_start:4.1f}s] Pos: x={current_x:.2f}, y={current_y:.2f} | Target: x={new_x:.2f}, y={new_y:.2f}")
+
+
+
+2nd to last task; Trajectory Smoothing:
