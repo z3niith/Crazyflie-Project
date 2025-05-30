@@ -28,7 +28,7 @@ roll_data, pitch_data, yaw_data = [], [], []
 WINDOW = 200
 plot_running = True
 
-URI = 'radio://0/80/2M'
+URI = 'radio://0/80/2M/E7E7E7E7E8'
 
 THRUST_MAX = 50000
 ROLL_PITCH_THRESHOLD = 30.0  # degrees
